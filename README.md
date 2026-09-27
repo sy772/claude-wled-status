@@ -18,7 +18,7 @@ It works well with a strip behind the monitor or keyboard. The colors and effect
 | 🟢 **Green, solid** | Finished. Your turn to reply. |
 | 🔴 **Red, slow breathe** | Something failed (API error, rate limit). Check the terminal. |
 | ⚪ **White, breathe** | Claude is compacting its context. Takes a moment. |
-| *your normal light* | Nothing happened for 15 minutes, or the session ended. Your previous WLED state is restored. |
+| *your normal light* | No Claude activity for 15 minutes (whatever the color was), or the session ended. Your previous WLED state is restored. |
 
 **Several Claude sessions open?** The most urgent state wins. If any session needs you, the light is orange.
 
@@ -70,8 +70,9 @@ WLED_NIGHT_BRIGHTNESS=70     # night brightness (0-255)
 WLED_NIGHT_START=23          # night mode from 23:00...
 WLED_NIGHT_END=7             # ...until 07:00
 
-# how long green stays before your normal light comes back (seconds)
-WLED_DONE_TIMEOUT=900
+# seconds without any Claude activity before your normal light comes back
+# (applies to every state, so nothing can stay stuck)
+WLED_IDLE_TIMEOUT=900
 
 # which WLED segment to use (if you split your strip)
 WLED_SEGMENT=0
@@ -104,7 +105,7 @@ Claude Code has [hooks](https://docs.claude.com/en/docs/claude-code/hooks): shel
 | `SubagentStart` / `SubagentStop` | agents (counted per session) |
 | `PermissionRequest`, `Notification` (permission / elicitation), `AskUserQuestion`, `ExitPlanMode` | ask |
 | `PreCompact` | compact |
-| `Stop` | done (restores your light after `WLED_DONE_TIMEOUT`) |
+| `Stop` | done |
 | `StopFailure` | fail |
 | `SessionEnd` | session removed |
 
@@ -113,9 +114,27 @@ Design notes:
 - **Only sends when something changes.** Hundreds of tool calls produce one request.
 - **Multi-session aware.** Each session's state is stored in `$XDG_RUNTIME_DIR/claude-wled-<uid>/`, and the light shows the most urgent one.
 - **Restores your light.** Before the first change it snapshots your WLED state, and it puts it back when Claude goes idle.
+- **Nothing stays stuck.** A single background watchdog checks every minute and drops any session that has been quiet for `WLED_IDLE_TIMEOUT`, so a light left over from an interrupted turn (Esc), a denied permission or a crashed terminal clears on its own. The watchdog exits once everything is idle.
 - **Failed tool calls are deliberately *not* flashed red.** Normal things like `grep` finding nothing count as "failures" and would make the light flicker constantly.
 
 Tested on Linux with WLED 16 and Claude Code 2.1. It should also work on macOS (with `flock` from Homebrew). Windows users can try WSL.
+
+---
+
+## Troubleshooting
+
+Every state change is logged to `$XDG_RUNTIME_DIR/claude-wled-<uid>/events.log` (on most Linux systems that is `/run/user/1000/claude-wled-1000/events.log`):
+
+```
+2026-09-27 21:18:35 3f2a91c0 fail -> fail (agents 0)
+2026-09-27 21:18:35 light idle -> fail (http 200)
+2026-09-27 21:33:42 timeout 3f2a91c0 (fail)
+2026-09-27 21:33:42 light fail -> idle (http 200)
+```
+
+- **Light shows an unexpected color?** `tail -20` the log to see which session and event caused it.
+- **`http 000`?** The WLED device could not be reached. Check `WLED_HOST` in `~/.claude/hooks/wled-status.conf`. The script retries on the next check.
+- **Nothing happens at all?** Run `/hooks` in Claude Code and check that the `wled-status.sh` entries are listed.
 
 ---
 

@@ -11,12 +11,13 @@ CONF="$(dirname "$0")/wled-status.conf"
 [ -f "$CONF" ] && . "$CONF"
 WLED="${WLED_HOST:-http://wled.local}"       # your WLED address
 SEG="${WLED_SEGMENT:-0}"                      # segment to use
-DONE_TIMEOUT="${WLED_DONE_TIMEOUT:-900}"      # seconds green stays on before restoring your light
+# after this many seconds without any Claude activity the light goes back to
+# normal, whatever state it was in (WLED_DONE_TIMEOUT is the old name)
+IDLE_TIMEOUT="${WLED_IDLE_TIMEOUT:-${WLED_DONE_TIMEOUT:-900}}"
 DAY_BRI="${WLED_BRIGHTNESS:-255}"             # brightness during the day (0-255)
 NIGHT_BRI="${WLED_NIGHT_BRIGHTNESS:-70}"      # brightness at night (0-255)
 NIGHT_START="${WLED_NIGHT_START:-23}"         # night mode from this hour...
 NIGHT_END="${WLED_NIGHT_END:-7}"              # ...until this hour
-STALE_MIN=180                                 # ignore sessions untouched for 3 hours
 
 # ---- Look of each state ----------------------------------------------------
 # color "r,g,b" | WLED effect id | speed | intensity
@@ -38,16 +39,105 @@ look() {
 
 EVENT="$1"
 INPUT="$(cat 2>/dev/null)"
-TS="$(date +%s%N)"
-case "$TS" in *N) TS="$(perl -MTime::HiRes=time -e 'printf "%d", time()*1e9')" ;; esac  # macOS
 DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-wled-$(id -u)"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+now_ns() {
+  local t; t="$(date +%s%N)"
+  case "$t" in *N) t="$(perl -MTime::HiRes=time -e 'printf "%d", time()*1e9')" ;; esac  # macOS
+  echo "$t"
+}
+TS="$(now_ns)"
 
 [ "${WLED_DISABLE:-0}" = 1 ] && exit 0
+
+log() {
+  local l="$DIR/events.log"
+  echo "$(date '+%F %T') $*" >>"$l"
+  if [ "$(wc -l <"$l")" -gt 1000 ]; then tail -n 500 "$l" >"$l.tmp" && mv "$l.tmp" "$l"; fi
+}
+
+# Merge all sessions (the most urgent state wins) and send it to WLED if it changed.
+# Sessions with no activity for IDLE_TIMEOUT are dropped. Caller holds the lock.
+apply_best() {
+  local now best=idle bp=0 p s a last sf
+  now="$(now_ns)"
+  for sf in "$DIR"/s_*; do
+    [ -f "$sf" ] || continue
+    read -r s a last <"$sf"
+    if [ $(( (now - ${last:-0}) / 1000000000 )) -ge "$IDLE_TIMEOUT" ]; then
+      rm -f "$sf"; log "timeout ${sf##*/s_} ($s)"; continue
+    fi
+    [ "${a:-0}" -gt 0 ] && [ "$s" != ask ] && [ "$s" != fail ] && s=agents
+    case "$s" in
+      ask) p=6 ;; fail) p=5 ;; compact) p=4 ;; agents) p=3 ;;
+      work) p=2 ;; done) p=1 ;; *) p=0 ;;
+    esac
+    [ "$p" -gt "$bp" ] && { bp=$p; best=$s; }
+  done
+
+  local prev; prev="$(cat "$DIR/current" 2>/dev/null || echo idle)"
+  [ "$prev" = "$best" ] && return
+
+  # remember your own light setting before Claude takes over
+  if [ "$prev" = idle ]; then
+    curl -s -m 2 "$WLED/json/state" -o "$DIR/saved.json.tmp" \
+      && mv "$DIR/saved.json.tmp" "$DIR/saved.json"
+  fi
+
+  local body code
+  if [ "$best" = idle ]; then
+    if [ -f "$DIR/saved.json" ]; then
+      body="$(jq -c '{on,bri,transition:10,seg:[.seg[]|{id,start,stop,on,bri,col,fx,sx,ix,pal,c1,c2,c3}]}' \
+        "$DIR/saved.json" 2>/dev/null)"
+    fi
+    [ -n "$body" ] || body='{"on":false}'
+  else
+    local h bri="$DAY_BRI" c fx sx ix
+    h=$(date +%-H)
+    if [ "$NIGHT_START" -gt "$NIGHT_END" ]; then
+      { [ "$h" -ge "$NIGHT_START" ] || [ "$h" -lt "$NIGHT_END" ]; } && bri="$NIGHT_BRI"
+    else
+      { [ "$h" -ge "$NIGHT_START" ] && [ "$h" -lt "$NIGHT_END" ]; } && bri="$NIGHT_BRI"
+    fi
+    read -r c fx sx ix <<<"$(look "$best")"
+    body='{"on":true,"bri":'"$bri"',"transition":4,"seg":[{"id":'"$SEG"',"on":true,"bri":255,"fx":'"$fx"',"sx":'"$sx"',"ix":'"$ix"',"pal":0,"col":[['"$c"'],[0,0,0],[0,0,0]]}]}'
+  fi
+  code="$(curl -s -m 2 -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' -d "$body" "$WLED/json/state")"
+  log "light $prev -> $best (http $code)"
+  # on failure mark the light as unknown so the next check retries
+  if [ "$code" = 200 ]; then echo "$best" >"$DIR/current"; else echo unknown >"$DIR/current"; fi
+}
+
+# One background process per user: re-checks every so often so the light
+# times out even when Claude is completely quiet. Exits once everything is idle.
+watchdog() {
+  exec 8>"$DIR/watchdog.lock"
+  flock -n 8 || return
+  local interval=$(( IDLE_TIMEOUT / 15 ))
+  [ "$interval" -lt 1 ] && interval=1
+  [ "$interval" -gt 60 ] && interval=60
+  while sleep "$interval"; do
+    (
+      exec 9>"$DIR/lock"
+      flock -w 5 9 || exit 0
+      apply_best
+    )
+    [ "$(cat "$DIR/current" 2>/dev/null)" = idle ] \
+      && ! ls "$DIR"/s_* >/dev/null 2>&1 && break
+  done
+}
 
 run() {
   mkdir -p "$DIR"
   exec 9>"$DIR/lock"
   flock -w 5 9 || exit 0
+
+  case "$EVENT" in
+    watchdog) exec 9>&-; watchdog; exit 0 ;;
+    expire:*) exit 0 ;;   # from older versions of this script; ignore
+  esac
 
   local sid tool
   sid="$(jq -r '.session_id // "x"' <<<"$INPUT" 2>/dev/null)"
@@ -59,84 +149,34 @@ run() {
   local state=idle agents=0 last=0
   [ -f "$f" ] && read -r state agents last <"$f"
 
+  # drop events that arrive out of order
+  [ "$TS" -lt "${last:-0}" ] 2>/dev/null && exit 0
+  last="$TS"
   case "$EVENT" in
-    expire:*)
-      # only go dark if nothing happened since that Stop
-      [ "${EVENT#expire:}" = "$last" ] && [ "$state" = done ] && state=idle
-      ;;
-    *)
-      # drop events that arrive out of order
-      [ "$TS" -lt "${last:-0}" ] 2>/dev/null && exit 0
-      last="$TS"
-      case "$EVENT" in
-        prompt|post) state=work ;;
-        pre)
-          case "$tool" in
-            AskUserQuestion|ExitPlanMode) state=ask ;;
-            *) state=work ;;
-          esac ;;
-        ask)       state=ask ;;
-        compact)   state=compact ;;
-        stop)      state=done ;;
-        fail)      state=fail ;;
-        sub_start) agents=$((agents + 1)) ;;
-        sub_stop)  agents=$((agents > 0 ? agents - 1 : 0)) ;;
-        end)       rm -f "$f"; state=gone ;;
-      esac
-      ;;
+    prompt|post) state=work ;;
+    pre)
+      case "$tool" in
+        AskUserQuestion|ExitPlanMode) state=ask ;;
+        *) state=work ;;
+      esac ;;
+    ask)       state=ask ;;
+    compact)   state=compact ;;
+    stop)      state=done; agents=0 ;;   # turn is over: no subagents left running
+    fail)      state=fail; agents=0 ;;
+    sub_start) agents=$((agents + 1)) ;;
+    sub_stop)  agents=$((agents > 0 ? agents - 1 : 0)) ;;
+    end)       state=gone ;;
+    *)         exit 0 ;;
   esac
-  [ "$state" != gone ] && echo "$state $agents $last" >"$f"
+  if [ "$state" = gone ]; then rm -f "$f"; else echo "$state $agents $last" >"$f"; fi
+  case "$EVENT" in pre|post) ;; *) log "${sid:0:8} $EVENT${tool:+ $tool} -> $state (agents $agents)" ;; esac
 
-  if [ "$EVENT" = stop ]; then
-    ( sleep "$DONE_TIMEOUT"; echo '{"session_id":"'"$sid"'"}' | "$0" "expire:$TS" ) \
-      </dev/null >/dev/null 2>&1 9>&- &
+  apply_best
+
+  # make sure the watchdog is running while anything is lit
+  if flock -n "$DIR/watchdog.lock" true 2>/dev/null; then
+    "$SELF" watchdog </dev/null >/dev/null 2>&1 9>&- &
   fi
-
-  # merge all sessions: the most urgent state wins
-  find "$DIR" -name 's_*' -mmin +"$STALE_MIN" -delete 2>/dev/null
-  local best=idle bp=0 p s a
-  for sf in "$DIR"/s_*; do
-    [ -f "$sf" ] || continue
-    read -r s a _ <"$sf"
-    [ "${a:-0}" -gt 0 ] && [ "$s" != ask ] && [ "$s" != fail ] && s=agents
-    case "$s" in
-      ask) p=6 ;; fail) p=5 ;; compact) p=4 ;; agents) p=3 ;;
-      work) p=2 ;; done) p=1 ;; *) p=0 ;;
-    esac
-    [ "$p" -gt "$bp" ] && { bp=$p; best=$s; }
-  done
-
-  [ "$(cat "$DIR/current" 2>/dev/null)" = "$best" ] && exit 0
-
-  local prev; prev="$(cat "$DIR/current" 2>/dev/null || echo idle)"
-  # remember your own light setting before Claude takes over
-  if [ "$prev" = idle ] && [ "$best" != idle ]; then
-    curl -s -m 2 "$WLED/json/state" -o "$DIR/saved.json.tmp" \
-      && mv "$DIR/saved.json.tmp" "$DIR/saved.json"
-  fi
-
-  if [ "$best" = idle ]; then
-    if [ -f "$DIR/saved.json" ]; then
-      jq -c '{on,bri,transition:10,seg:[.seg[]|{id,start,stop,on,bri,col,fx,sx,ix,pal,c1,c2,c3}]}' \
-        "$DIR/saved.json" 2>/dev/null \
-        | curl -s -m 2 -X POST -H 'Content-Type: application/json' -d @- "$WLED/json/state" >/dev/null
-    else
-      curl -s -m 2 -X POST -d '{"on":false}' "$WLED/json/state" >/dev/null
-    fi
-  else
-    local h bri="$DAY_BRI" c fx sx ix
-    h=$(date +%-H)
-    if [ "$NIGHT_START" -gt "$NIGHT_END" ]; then
-      { [ "$h" -ge "$NIGHT_START" ] || [ "$h" -lt "$NIGHT_END" ]; } && bri="$NIGHT_BRI"
-    else
-      { [ "$h" -ge "$NIGHT_START" ] && [ "$h" -lt "$NIGHT_END" ]; } && bri="$NIGHT_BRI"
-    fi
-    read -r c fx sx ix <<<"$(look "$best")"
-    curl -s -m 2 -X POST -H 'Content-Type: application/json' \
-      -d '{"on":true,"bri":'"$bri"',"transition":4,"seg":[{"id":'"$SEG"',"on":true,"bri":255,"fx":'"$fx"',"sx":'"$sx"',"ix":'"$ix"',"pal":0,"col":[['"$c"'],[0,0,0],[0,0,0]]}]}' \
-      "$WLED/json/state" >/dev/null
-  fi
-  echo "$best" >"$DIR/current"
 }
 
 ( run ) </dev/null >/dev/null 2>&1 &
