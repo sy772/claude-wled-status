@@ -18,7 +18,7 @@ It works well with a strip behind the monitor or keyboard. The colors and effect
 | 🟢 **Green, solid** | Finished. Your turn to reply. |
 | 🔴 **Red, slow breathe** | Something failed (API error, rate limit). Check the terminal. |
 | ⚪ **White, breathe** | Claude is compacting its context. Takes a moment. |
-| *your normal light* | No Claude activity for 15 minutes (whatever the color was), or the session ended. Your previous WLED state is restored. |
+| *your normal light* (or off) | No Claude activity for 15 minutes (whatever the color was), or the session ended. Your previous WLED state is restored, or the light turns off if you set `WLED_IDLE_ACTION=off`. |
 
 **Several Claude sessions open?** The most urgent state wins. If any session needs you, the light is orange.
 
@@ -74,6 +74,10 @@ WLED_NIGHT_END=7             # ...until 07:00
 # (applies to every state, so nothing can stay stuck)
 WLED_IDLE_TIMEOUT=900
 
+# what happens after that: "restore" (default) brings back the light you had
+# before Claude started; "off" always turns the light off
+WLED_IDLE_ACTION=restore
+
 # which WLED segment to use (if you split your strip)
 WLED_SEGMENT=0
 
@@ -113,7 +117,7 @@ Design notes:
 - **Never slows Claude down.** The hook returns immediately and the HTTP call happens in the background with a 2-second timeout. If WLED is offline, nothing breaks.
 - **Only sends when something changes.** Hundreds of tool calls produce one request.
 - **Multi-session aware.** Each session's state is stored in `$XDG_RUNTIME_DIR/claude-wled-<uid>/`, and the light shows the most urgent one.
-- **Restores your light.** Before the first change it snapshots your WLED state, and it puts it back when Claude goes idle.
+- **Restores your light.** Before the first change it snapshots your WLED state, and it puts it back when Claude goes idle. If your normal light looks like one of the status colors (e.g. a red preset), set `WLED_IDLE_ACTION=off` so an idle light can never be mistaken for a Claude state.
 - **Nothing stays stuck.** A single background watchdog checks every minute and drops any session that has been quiet for `WLED_IDLE_TIMEOUT`, so a light left over from an interrupted turn (Esc), a denied permission or a crashed terminal clears on its own. The watchdog exits once everything is idle.
 - **Failed tool calls are deliberately *not* flashed red.** Normal things like `grep` finding nothing count as "failures" and would make the light flicker constantly.
 

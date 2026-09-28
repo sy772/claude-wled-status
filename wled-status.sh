@@ -14,6 +14,9 @@ SEG="${WLED_SEGMENT:-0}"                      # segment to use
 # after this many seconds without any Claude activity the light goes back to
 # normal, whatever state it was in (WLED_DONE_TIMEOUT is the old name)
 IDLE_TIMEOUT="${WLED_IDLE_TIMEOUT:-${WLED_DONE_TIMEOUT:-900}}"
+# what happens then: "restore" = the light you had before Claude started,
+# "off" = turn the light off (your own colors/effect are kept for next time)
+IDLE_ACTION="${WLED_IDLE_ACTION:-restore}"
 DAY_BRI="${WLED_BRIGHTNESS:-255}"             # brightness during the day (0-255)
 NIGHT_BRI="${WLED_NIGHT_BRIGHTNESS:-70}"      # brightness at night (0-255)
 NIGHT_START="${WLED_NIGHT_START:-23}"         # night mode from this hour...
@@ -88,7 +91,9 @@ apply_best() {
   local body code
   if [ "$best" = idle ]; then
     if [ -f "$DIR/saved.json" ]; then
-      body="$(jq -c '{on,bri,transition:10,seg:[.seg[]|{id,start,stop,on,bri,col,fx,sx,ix,pal,c1,c2,c3}]}' \
+      body="$(jq -c --arg a "$IDLE_ACTION" \
+        '{on:(if $a == "off" then false else .on end),bri,transition:10,
+          seg:[.seg[]|{id,start,stop,on,bri,col,fx,sx,ix,pal,c1,c2,c3}]}' \
         "$DIR/saved.json" 2>/dev/null)"
     fi
     [ -n "$body" ] || body='{"on":false}'
@@ -105,7 +110,11 @@ apply_best() {
   fi
   code="$(curl -s -m 2 -o /dev/null -w '%{http_code}' -X POST \
     -H 'Content-Type: application/json' -d "$body" "$WLED/json/state")"
-  log "light $prev -> $best (http $code)"
+  if [ "$best" = idle ]; then
+    log "light $prev -> idle (http $code) $IDLE_ACTION: $(jq -c '{on,fx:.seg[0].fx,col:.seg[0].col[0]}' <<<"$body" 2>/dev/null)"
+  else
+    log "light $prev -> $best (http $code)"
+  fi
   # on failure mark the light as unknown so the next check retries
   if [ "$code" = 200 ]; then echo "$best" >"$DIR/current"; else echo unknown >"$DIR/current"; fi
 }
